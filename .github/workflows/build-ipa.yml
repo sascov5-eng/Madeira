@@ -1,0 +1,298 @@
+name: Build Madeira IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/build-ipa.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      IOS_DEPLOYMENT_TARGET: "17.0"
+
+    steps:
+      - name: Checkout Madeira and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Toolchain info
+        run: |
+          set -euxo pipefail
+          sw_vers
+          uname -a
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          cmake --version
+          git submodule status --recursive
+
+      - name: Install build tools
+        run: |
+          set -euxo pipefail
+          brew install ninja meson pkg-config autoconf automake libtool llvm bison gettext
+          echo "$(brew --prefix llvm)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix gettext)/bin" >> "$GITHUB_PATH"
+
+      - name: Build FEX static libraries for iOS
+        run: |
+          set -euxo pipefail
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER="$(xcrun -f clang)" \
+            -DCMAKE_CXX_COMPILER="$(xcrun -f clang++)" \
+            -DBUILD_FEX_LINUX_TESTS=OFF \
+            -DBUILD_THUNKS=OFF \
+            -DBUILD_FEXCONFIG=OFF \
+            -DBUILD_TESTING=OFF \
+            -DENABLE_LTO=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_GDB_SYMBOLS=OFF \
+            -DENABLE_OFFLINE_TELEMETRY=OFF
+          cmake --build FEX/build-ios --target FEXCore FEXCore_Base JemallocLibs -j 3
+          test -f FEX/build-ios/FEXCore/Source/libFEXCore.a
+          test -f FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
+          test -f FEX/build-ios/FEXCore/Source/libJemallocLibs.a
+
+      - name: Configure host Wine tree for generated headers
+        run: |
+          set -euxo pipefail
+          mkdir -p wine/build-macos
+          cd wine/build-macos
+          ../configure \
+            --disable-tests \
+            --without-x \
+            --without-wayland \
+            --without-gstreamer \
+            --without-oss \
+            --without-pulse \
+            --without-alsa \
+            --without-cups \
+            --without-dbus \
+            --without-fontconfig \
+            --without-freetype
+          make -j 3 server/wineserver
+          cd ../..
+          mkdir -p wine/build-arm64ec/include
+          cp -f wine/build-macos/include/dwrite*.h wine/build-arm64ec/include/ 2>/dev/null || true
+          test -f wine/build-macos/include/config.h
+
+      - name: Build iOS base wineserver archive
+        run: |
+          set -euxo pipefail
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          WINE_SRC="$PWD/wine"
+          WINE_BUILD="$PWD/wine/build-macos"
+          B="$PWD/build/wineserver"
+          OBJ="$B/base-obj"
+          rm -rf "$OBJ"
+          mkdir -p "$OBJ" app/Madeira
+
+          common=(
+            -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$IOS_DEPLOYMENT_TARGET" -O2
+            -I"$WINE_SRC/include" -I"$WINE_SRC/include/wine"
+            -I"$WINE_BUILD/include" -I"$WINE_BUILD/server"
+            -I"$WINE_SRC/server" -I"$B"
+            -I"$PWD/build/ntdll-unix/shims"
+            -include "$B/config_ios.h" -include stdarg.h
+            -include "$B/unicode_fix.h" -include "$B/wineserver_ios_kill.h"
+            -D__WINESRC__ -DWINE_IOS=1 -Dmain=wineserver_main
+            -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
+            -Wno-implicit-function-declaration -Wno-int-conversion
+          )
+
+          for upstream in "$WINE_SRC"/server/*.c; do
+            base="$(basename "$upstream")"
+            name="${base%.c}"
+            src="$upstream"
+            case "$base" in
+              request.c) src="$B/request_ios.c" ;;
+              main.c) src="$B/main_ios.c" ;;
+              mach.c) src="$B/mach_ios.c" ;;
+              unicode.c) src="$B/unicode_ios.c" ;;
+              fd.c) src="$B/fd_ios.c" ;;
+              window.c) src="$B/window_ios.c" ;;
+              mapping.c) src="$B/mapping_ios.c" ;;
+              queue.c) src="$B/queue_ios.c" ;;
+            esac
+            echo "[wineserver-base] $name"
+            xcrun -sdk iphoneos clang "${common[@]}" -c "$src" -o "$OBJ/$name.o"
+          done
+
+          # Madeira's iOS logging and kill wrapper are additional translation units.
+          if [ -f "$B/wine_log_ios.c" ]; then
+            xcrun -sdk iphoneos clang "${common[@]}" -c "$B/wine_log_ios.c" -o "$OBJ/wine_log_ios.o"
+          fi
+          xcrun -sdk iphoneos clang \
+            -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$IOS_DEPLOYMENT_TARGET" -O2 \
+            -I"$B" -DWINE_IOS=1 -Wno-implicit-function-declaration \
+            -c "$B/wineserver_ios_kill.c" -o "$OBJ/wineserver_ios_kill.o"
+
+          ar rcs app/Madeira/libwineserver.a "$OBJ"/*.o
+          file app/Madeira/libwineserver.a
+          bash build/wineserver/build.sh all
+
+      - name: Build GnuTLS stack for iOS
+        run: |
+          set -euxo pipefail
+          bash build/gnutls-ios/build.sh
+
+      - name: Build FreeType for iOS
+        run: |
+          set -euxo pipefail
+          if [ ! -d research/freetype/.git ]; then
+            git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+          fi
+          bash build/freetype-ios/build.sh
+
+      - name: Build Wine unix-side libraries for iOS
+        run: |
+          set -euxo pipefail
+          # dwrite's generated headers are architecture-independent; the iOS
+          # unixlib build expects them at this historical build-arm64ec path.
+          mkdir -p wine/build-arm64ec/include
+          cp -f wine/build-macos/include/dwrite*.h wine/build-arm64ec/include/ 2>/dev/null || true
+          bash build/ntdll-unix/build.sh
+          bash build/win32u-unix/build.sh
+          test -f app/Madeira/libntdll_unix.a
+          test -f app/Madeira/libwin32u_unix.a
+          test -f app/Madeira/libwineserver.a
+
+      - name: Build LLVM 15 static libraries for iOS
+        run: |
+          set -euxo pipefail
+          mkdir -p toolchains
+          if [ ! -d toolchains/llvm-project/.git ]; then
+            git clone --depth 1 --branch llvmorg-15.0.7 https://github.com/llvm/llvm-project.git toolchains/llvm-project
+          fi
+
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host-build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF
+          cmake --build toolchains/llvm-host-build --target llvm-tblgen -j 3
+
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake')
+          s = p.read_text()
+          s2 = s.replace('MATCHES "Darwin"', 'MATCHES "Darwin|iOS"')
+          if s == s2:
+              print('AddLLVM.cmake Darwin matcher already patched or changed upstream')
+          else:
+              p.write_text(s2)
+          PY
+
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=18.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host-build/bin/llvm-tblgen" \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_TOOLS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF
+          cmake --build toolchains/llvm-ios-build -j 3
+          ls -1 toolchains/llvm-ios-build/lib/*.a | head
+
+      - name: Build DXMT iOS static library
+        run: |
+          set -euxo pipefail
+          bash build/dxmt-ios/build.sh
+          xcrun -sdk iphoneos libtool -static \
+            -o app/Madeira/libdxmt_combined.a \
+            build/dxmt-ios/obj/*.o toolchains/llvm-ios-build/lib/*.a
+          test -f app/Madeira/libdxmt_combined.a
+          file app/Madeira/libdxmt_combined.a
+
+      - name: Verify Xcode link inputs
+        run: |
+          set -euxo pipefail
+          files=(
+            FEX/build-ios/FEXCore/Source/libFEXCore.a
+            FEX/build-ios/FEXCore/Source/libFEXCore_Base.a
+            FEX/build-ios/FEXCore/Source/libJemallocLibs.a
+            FEX/build-ios/External/fmt/libfmt.a
+            FEX/build-ios/External/cephes/libcephes_128bit.a
+            FEX/build-ios/External/xxhash/cmake_unofficial/libxxhash.a
+            FEX/build-ios/External/SoftFloat-3e/libsoftfloat_3e.a
+            app/Madeira/libwineserver.a
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+            app/Madeira/libdxmt_combined.a
+          )
+          for f in "${files[@]}"; do
+            test -f "$f" || { echo "MISSING: $f"; exit 1; }
+            echo "OK: $f ($(du -h "$f" | awk '{print $1}'))"
+          done
+
+      - name: Build unsigned Madeira app
+        run: |
+          set -euxo pipefail
+          mkdir -p "$PWD/build/ipa-products"
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -target Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CONFIGURATION_BUILD_DIR="$PWD/build/ipa-products" \
+            build
+          test -d build/ipa-products/Madeira.app
+
+      - name: Package unsigned IPA
+        run: |
+          set -euxo pipefail
+          rm -rf build/ipa-payload
+          mkdir -p build/ipa-payload/Payload
+          cp -R build/ipa-products/Madeira.app build/ipa-payload/Payload/
+          (cd build/ipa-payload && /usr/bin/zip -qry ../Madeira-unsigned.ipa Payload)
+          ls -lh build/Madeira-unsigned.ipa
+
+      - name: Upload Madeira IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-unsigned-ipa
+          path: build/Madeira-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload diagnostic logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Madeira-build-logs
+          path: |
+            wine/build-macos/config.log
+            build/**/*.err
+            build/**/*.log
+          if-no-files-found: ignore
+          retention-days: 7
