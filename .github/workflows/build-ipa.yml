@@ -6,6 +6,8 @@ on:
     branches: [main]
     paths:
       - .github/workflows/build-ipa.yml
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: read
@@ -132,7 +134,6 @@ jobs:
             xcrun -sdk iphoneos clang "${common[@]}" -c "$src" -o "$OBJ/$name.o"
           done
 
-          # Madeira's iOS logging and kill wrapper are additional translation units.
           if [ -f "$B/wine_log_ios.c" ]; then
             xcrun -sdk iphoneos clang "${common[@]}" -c "$B/wine_log_ios.c" -o "$OBJ/wine_log_ios.o"
           fi
@@ -161,8 +162,6 @@ jobs:
       - name: Build Wine unix-side libraries for iOS
         run: |
           set -euxo pipefail
-          # dwrite's generated headers are architecture-independent; the iOS
-          # unixlib build expects them at this historical build-arm64ec path.
           mkdir -p wine/build-arm64ec/include
           cp -f wine/build-macos/include/dwrite*.h wine/build-arm64ec/include/ 2>/dev/null || true
           bash build/ntdll-unix/build.sh
